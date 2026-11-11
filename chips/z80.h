@@ -370,7 +370,10 @@ uint64_t z80_init(z80_t* cpu);
 // immediately put Z80 into reset state
 uint64_t z80_reset(z80_t* cpu);
 // execute one tick, return new pin mask
-uint64_t z80_tick(z80_t* cpu, uint64_t pins);
+#ifndef Z80_TICK_ATTR
+#define Z80_TICK_ATTR
+#endif
+Z80_TICK_ATTR uint64_t z80_tick(z80_t* cpu, uint64_t pins);
 // force execution to continue at address 'new_pc'
 uint64_t z80_prefetch(z80_t* cpu, uint16_t new_pc);
 // return true when full instruction has finished
@@ -1065,7 +1068,10 @@ uint64_t z80_prefetch(z80_t* cpu, uint16_t new_pc) {
 #define _cc_p           (!(cpu->f&Z80_SF))
 #define _cc_m           (cpu->f&Z80_SF)
 
-uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
+#ifndef Z80_TICK_ATTR
+#define Z80_TICK_ATTR
+#endif
+Z80_TICK_ATTR uint64_t z80_tick(z80_t* cpu, uint64_t pins) {
     pins &= ~(Z80_CTRL_PIN_MASK|Z80_RETI);
     switch (cpu->step) {
         // <% decoder

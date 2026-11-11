@@ -156,10 +156,27 @@ typedef struct {
         int sample_pos;
         float sample_buffer[ZX_MAX_AUDIO_SAMPLES];
     } audio;
+#ifdef ZX_EXTERNAL_MEMORY
+    uint8_t *ram[8];
+#else
     uint8_t ram[8][0x4000];
+#endif
+#ifdef ZX_EXTERNAL_MEMORY
+    uint8_t *rom[2];
+#else
     uint8_t rom[2][0x4000];
+#endif
+#ifdef ZX_EXTERNAL_MEMORY
+    uint8_t *junk;
+#else
     uint8_t junk[0x4000];
+#endif
+#ifdef ZX_EXTERNAL_MEMORY
+    uint8_t *fb;
+#else
     alignas(64) uint8_t fb[ZX_FRAMEBUFFER_SIZE_BYTES];
+#endif
+    uint8_t physical_keys[8];
 } zx_t;
 
 // initialize a new ZX Spectrum instance
@@ -214,6 +231,9 @@ void zx_init(zx_t* sys, const zx_desc_t* desc) {
     if (desc->debug.callback.func) { CHIPS_ASSERT(desc->debug.stopped); }
 
     memset(sys, 0, sizeof(zx_t));
+#ifdef ZX_EXTERNAL_MEMORY
+    ZX_EXTERNAL_MEMORY(sys);
+#endif
     sys->valid = true;
     sys->type = desc->type;
     sys->joystick_type = desc->joystick_type;
@@ -316,6 +336,9 @@ static bool _zx_decode_scanline(zx_t* sys) {
     const int btm_decode_line = sys->top_border_scanlines + 192 + 32;
     if ((sys->scanline_y >= top_decode_line) && (sys->scanline_y < btm_decode_line)) {
         const uint16_t y = sys->scanline_y - top_decode_line;
+#ifdef ZX_CAPTURE_SCANLINE
+        ZX_CAPTURE_SCANLINE(sys,y);
+#else
         uint8_t* dst = &sys->fb[y * ZX_FRAMEBUFFER_WIDTH];
         const uint8_t* vidmem_bank = sys->ram[sys->display_ram_bank];
         const bool blink = 0 != (sys->blink_counter & 0x10);
@@ -372,9 +395,10 @@ static bool _zx_decode_scanline(zx_t* sys) {
                 *dst++ = sys->border_color;
             }
         }
+#endif
     }
 
-    if (sys->scanline_y++ >= sys->frame_scan_lines) {
+    if (++sys->scanline_y >= sys->frame_scan_lines) {
         // start new frame, request vblank interrupt
         sys->scanline_y = 0;
         sys->blink_counter++;
@@ -413,8 +437,44 @@ static void _zx_update_memory_map_zx128(zx_t* sys, uint8_t data) {
     }
 }
 
-static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
+#ifdef ZX_48K_ONLY
+#define ZX_IS_128(s) false
+#else
+#define ZX_IS_128(s) ((s)->type==ZX_TYPE_128)
+#endif
+#ifndef ZX_PROFILE
+#define ZX_PROFILE(stage) ((void)0)
+#endif
+#ifndef ZX_INLINE_TICK
+#define ZX_INLINE_TICK static
+#endif
+#ifndef ZX_MEM_RD
+#define ZX_MEM_RD(s,a) mem_rd(&(s)->mem,a)
+#define ZX_MEM_WR(s,a,v) mem_wr(&(s)->mem,a,v)
+#endif
+#ifdef ZX_AUDIO_COLD_SAMPLE
+// Keep sample production out of the cycle-stepping loop. The caller performs
+// the countdown; undo that one decrement before using the unchanged beeper API.
+static __attribute__((noinline)) void _zx_audio_sample(zx_t *sys) {
+    sys->beeper.counter += BEEPER_FIXEDPOINT_SCALE;
+    if (beeper_tick(&sys->beeper)) {
+        // new sample ready (if this is not a ZX128, sys->ay.sample will be 0)
+        const float sample = sys->beeper.sample + sys->ay.sample;
+        sys->audio.sample_buffer[sys->audio.sample_pos++] = sample;
+        if (sys->audio.sample_pos == sys->audio.num_samples) {
+            if (sys->audio.callback.func) {
+                sys->audio.callback.func(sys->audio.sample_buffer, sys->audio.num_samples, sys->audio.callback.user_data);
+            }
+            sys->audio.sample_pos = 0;
+        }
+    }
+}
+#endif
+
+ZX_INLINE_TICK uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
+    ZX_PROFILE(0);
     pins = z80_tick(&sys->cpu, pins);
+    ZX_PROFILE(1);
 
     // video decoding and vblank interrupt
     if (--sys->scanline_counter <= 0) {
@@ -435,19 +495,25 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         }
     }
 
+    ZX_PROFILE(2);
     if (pins & Z80_MREQ) {
         // a memory request
         // FIXME: 'contended memory'
         const uint16_t addr = Z80_GET_ADDR(pins);
         if (pins & Z80_RD) {
-            Z80_SET_DATA(pins, mem_rd(&sys->mem, addr));
+            Z80_SET_DATA(pins, ZX_MEM_RD(sys, addr));
         }
         else if (pins & Z80_WR) {
-            mem_wr(&sys->mem, addr, Z80_GET_DATA(pins));
+            ZX_MEM_WR(sys, addr, Z80_GET_DATA(pins));
         }
     }
     else if (pins & Z80_IORQ) {
-        if ((pins & Z80_A0) == 0) {
+        // ULA interrupt acknowledge: no peripheral drives the bus; pull-ups
+        // supply FF. Elite's IM2 table requires this rather than stale data.
+        if (pins & Z80_M1) {
+            Z80_SET_DATA(pins, 0xFF);
+        }
+        else if ((pins & Z80_A0) == 0) {
             /* Spectrum ULA (...............0)
                 Bits 5 and 7 as read by INning from Port 0xfe are always one
             */
@@ -455,12 +521,17 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
                 // read from ULA
                 uint8_t data = (1<<7)|(1<<5);
                 // MIC/EAR flags -> bit 6
+                #ifdef ZX_EAR_INPUT
+                if (ZX_EAR_INPUT(sys)) {
+#else
                 if (sys->last_fe_out & (1<<3|1<<4)) {
+#endif
                     data |= (1<<6);
                 }
                 // keyboard matrix bits are encoded in the upper 8 bit of the port address
                 uint16_t column_mask = (~(Z80_GET_ADDR(pins)>>8)) & 0x00FF;
-                const uint16_t kbd_lines = kbd_test_lines(&sys->kbd, column_mask);
+                uint16_t kbd_lines = kbd_test_lines(&sys->kbd, column_mask);
+                for (int row=0;row<8;row++) if(column_mask & (1u<<row)) kbd_lines |= sys->physical_keys[row];
                 data |= (~kbd_lines) & 0x1F;
                 Z80_SET_DATA(pins, data);
             }
@@ -473,13 +544,13 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
                 beeper_set(&sys->beeper, 0 != (data & (1<<4)));
             }
         }
-        else if (((pins & (Z80_WR|Z80_A15|Z80_A1)) == Z80_WR) && (sys->type == ZX_TYPE_128)) {
+        else if (((pins & (Z80_WR|Z80_A15|Z80_A1)) == Z80_WR) && ZX_IS_128(sys)) {
             /* Spectrum 128 memory control (0.............0.)
                 http://8bit.yarek.pl/computer/zx.128/
             */
             _zx_update_memory_map_zx128(sys, Z80_GET_DATA(pins));
         }
-        else if (((pins & (Z80_A15|Z80_A1)) == Z80_A15) && (sys->type == ZX_TYPE_128)) {
+        else if (((pins & (Z80_A15|Z80_A1)) == Z80_A15) && ZX_IS_128(sys)) {
             // AY-3-8912 access (1*............0.)
             if (pins & Z80_A14) { pins |= AY38910_BC1; }
             if (pins & Z80_WR) { pins |= AY38910_BDIR; }
@@ -491,12 +562,18 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
         }
     }
 
+    ZX_PROFILE(3);
     // tick the AY at half frequency, use the buffered chip select
     // pin mask so that the AY doesn't miss any IO requests
-    if (++sys->tick_count & 1) {
+    if (ZX_IS_128(sys) && (++sys->tick_count & 1)) {
         ay38910_tick(&sys->ay);
     }
 
+#ifdef ZX_AUDIO_COLD_SAMPLE
+    if ((sys->beeper.counter -= BEEPER_FIXEDPOINT_SCALE) <= 0) {
+        _zx_audio_sample(sys);
+    }
+#else
     // tick the beeper
     if (beeper_tick(&sys->beeper)) {
         // new sample ready (if this is not a ZX128, sys->ay.sample will be 0)
@@ -509,19 +586,24 @@ static uint64_t _zx_tick(zx_t* sys, uint64_t pins) {
             sys->audio.sample_pos = 0;
         }
     }
+#endif
+    ZX_PROFILE(4);
     return pins;
 }
 
-uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
+static uint32_t zx_exec_ticks(zx_t* sys, uint32_t num_ticks) {
     CHIPS_ASSERT(sys && sys->valid);
-    const uint32_t num_ticks = clk_us_to_ticks(sys->freq_hz, micro_seconds);
     uint64_t pins = sys->pins;
-    if (0 == sys->debug.callback.func) {
+#ifndef ZX_NO_DEBUG
+    if (0 == sys->debug.callback.func)
+#endif
+    {
         // run without debug hook
         for (uint32_t tick = 0; tick < num_ticks; tick++) {
             pins = _zx_tick(sys, pins);
         }
     }
+    #ifndef ZX_NO_DEBUG
     else {
         // run with debug hook
         for (uint32_t tick = 0; (tick < num_ticks) && !(*sys->debug.stopped); tick++) {
@@ -529,9 +611,14 @@ uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
             sys->debug.callback.func(sys->debug.callback.user_data, pins);
         }
     }
+    #endif
     sys->pins = pins;
-    kbd_update(&sys->kbd, micro_seconds);
     return num_ticks;
+}
+uint32_t zx_exec(zx_t* sys, uint32_t micro_seconds) {
+    uint32_t ticks=zx_exec_ticks(sys,clk_us_to_ticks(sys->freq_hz,micro_seconds));
+    kbd_update(&sys->kbd,micro_seconds);
+    return ticks;
 }
 
 void zx_key_down(zx_t* sys, int key_code) {
